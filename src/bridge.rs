@@ -1,5 +1,7 @@
+use std::cmp::max;
 use std::collections::HashMap;
 use std::env;
+use std::pin::Pin;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,19 +16,43 @@ use tokio::time::sleep;
 use warp::http::StatusCode;
 use warp::reply::{json, with_status};
 use warp::sse::Event as SseEvent;
-use crate::store::inmem::MemoryStore;
-use crate::store::store::{Event, Store};
 use leaky_bucket::RateLimiter;
 use serde::{Deserialize, Serialize};
 use crate::metrics::Metrics;
 use base64::decoded_len_estimate;
+use tokio_stream::{Stream, StreamExt};
 use crate::webhook::webhook_worker;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Event {
+    pub id: u64,
+    pub deadline: i64,
+    pub from: String,
+    pub message: Vec<u8>,
+}
+
+impl Event {
+    pub fn to_sse_event(&self) -> SseEvent {
+        let event_data = BASE64_STANDARD.encode(&self.message);
+        let json = json!({
+                        "from": &self.from,
+                        "message": event_data,
+                    });
+
+
+        SseEvent::default()
+            .data(json.to_string())
+            .id(&self.id.to_string())
+            .event("message")
+    }
+}
+
 
 #[derive(Clone)]
 struct Client {
     signal: broadcast::Sender<()>,
     last_used: Arc<AtomicI64>,
-    store: Arc<MemoryStore>,
+    store: Arc<AsyncMutex<Vec<Event>>>,
     push_limiter: Arc<RateLimiter>,
 }
 
@@ -118,7 +144,7 @@ impl SSEConfig {
         Client {
             signal: tx,
             last_used: Arc::new(AtomicI64::new(current_time())),
-            store: Arc::new(MemoryStore::new()),
+            store: Arc::new(AsyncMutex::new(Vec::with_capacity(32))),
             push_limiter: Arc::new(push_limiter),
         }
     }
@@ -139,6 +165,33 @@ fn current_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_nanos() as i64
+}
+
+// Helper function for sending events
+async fn send_events<'a>(
+    clients: &'a [Client],
+    last_event_id: &'a mut u64,
+    metrics: Arc<AsyncMutex<Metrics>>,
+) -> Pin<Box<dyn Stream<Item=Result<SseEvent, warp::Error>> + Send + 'a>> {
+    let stream = async_stream::stream! {
+            let current_time_seconds = current_time();
+        
+            for cli in clients {
+                let events = cli.store.lock().await;
+                for e in events.iter() {
+                    if e.id > *last_event_id && e.deadline - current_time_seconds >= 0 {
+                        {
+                            let metrics = metrics.lock().await;
+                            metrics.delivered_messages.inc();
+                        }
+                        *last_event_id = max(*last_event_id, e.id);
+                        yield Ok(e.to_sse_event());
+                    }
+                }
+            }
+        };
+
+    Box::pin(stream)
 }
 
 
@@ -180,7 +233,7 @@ impl SSE {
 
         sse
     }
-    
+
 
     async fn cleaner_worker(&self) {
         loop {
@@ -282,27 +335,15 @@ impl SSE {
         }
 
         let metrics = self.metrics.clone();
+        let mut last_event_id = last_event_id.unwrap_or(0);
         let stream = async_stream::stream! {
-            let mut last_event_id = last_event_id.unwrap_or(0);
-            let mut events_to_send = Vec::new();
             
             // send missed events
-            for cli in &clients {
-                let execution = cli.store.execute_all(last_event_id, |event| {
-                    last_event_id = event.id;
-                    events_to_send.push(event.to_sse_event());
-                });
-                
-                execution.await;
-                cli.set_used().await;
-            }
-            
             {
-                let metrics = metrics.lock().await;
-                for event in events_to_send {
-                    metrics.delivered_messages.inc();
-                    yield Ok(event);
-                }   
+                let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
+                while let Some(event) = event_stream.next().await {
+                    yield event;
+                }
             }
 
             loop {
@@ -326,27 +367,13 @@ impl SSE {
                         received
                     } => {
                         if let Some(_) = res {
-                            let mut events_to_send = Vec::new();
-                            
                             info!("events signal [{}]", client_ids_str);
                             
                             // send actual events
-                            for cli in &clients {
-                                let execution = cli.store.execute_all(last_event_id, |event| {
-                                    events_to_send.push(event.to_sse_event());
-                                    
-                                    last_event_id = event.id;
-                                });
-                                
-                                execution.await;
-                                cli.set_used().await;
-                            }
-                            
                             {
-                                let metrics = metrics.lock().await;
-                                for event in events_to_send {
-                                    metrics.delivered_messages.inc();
-                                    yield Ok(event);
+                                let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
+                                while let Some(event) = event_stream.next().await {
+                                    yield event;
                                 }
                             }
                         }
@@ -450,43 +477,51 @@ impl SSE {
             deadline: now_nanos + Duration::from_secs(ttl).as_nanos() as i64,
         };
 
-        if cli.store.push(&event).await {
-            cli.set_used().await;
+        let current_time = current_time();
+        let mut events = cli.store.lock().await;
+        
+        // cleanup expired events
+        events.retain(|e| e.deadline - current_time >= 0);
 
-            debug!("pushed [{}] to [{}]", client_id, to);
-
-            let metrics = self.metrics.lock().await;
-
-            {
-                metrics.pushed_messages.inc();
-                metrics.requests.with_label_values(&["push", host.as_str()]).observe(1.0);
-            }
-
-            if let (Some(topic), Some(webhook_store)) = (topic, &self.webhook_store) {
-                let webhook_data = WebhookData {
-                    client_id: client_id.clone(),
-                    topic: topic.clone(),
-                    hash: decoded_body.clone(),
-                };
-
-                webhook_store.store.lock().await.push(webhook_data);
-                let _ = webhook_store.signal.send(());
-            }
-
-            let _ = cli.signal.send(());
-            Ok(with_status(
-                json(&json!({
-                        "status": "OK"
-                    })),
-                StatusCode::OK,
-            ))
-        } else {
-            Ok(with_status(
+        if events.len() >= 32 {
+            return Ok(with_status(
                 json(&json!({
                         "error": "Client's buffer overflow"
                     })),
                 StatusCode::FORBIDDEN,
-            ))
+            ));
         }
+
+        events.push(event);
+
+        cli.set_used().await;
+
+        debug!("pushed [{}] to [{}]", client_id, to);
+
+        let metrics = self.metrics.lock().await;
+
+        {
+            metrics.pushed_messages.inc();
+            metrics.requests.with_label_values(&["push", host.as_str()]).observe(1.0);
+        }
+
+        if let (Some(topic), Some(webhook_store)) = (topic, &self.webhook_store) {
+            let webhook_data = WebhookData {
+                client_id: client_id.clone(),
+                topic: topic.clone(),
+                hash: decoded_body.clone(),
+            };
+
+            webhook_store.store.lock().await.push(webhook_data);
+            let _ = webhook_store.signal.send(());
+        }
+
+        let _ = cli.signal.send(());
+        Ok(with_status(
+            json(&json!({
+                    "status": "OK"
+                })),
+            StatusCode::OK,
+        ))
     }
 }
