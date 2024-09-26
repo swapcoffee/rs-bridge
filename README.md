@@ -47,8 +47,30 @@ You can configure the server using environment variables. Here is the list of av
 | **SSE_BRIDGE_PORT**               | Port for the bridge server.                                              | 8080          | Integer           |
 | **SSE_METRICS_PORT**              | Port for the Prometheus metrics server.                                  | 8081          | Integer           |
 
-⚠️ **Note:** If you provide authentication token for webhooks, it will be sent as a `Bearer` token in the
-`Authorization` header meaning there is not need to prefix it with `Bearer`.
+# Webhooks
+
+The server supports webhook notifications for wallet events. You can configure the webhook URL and authentication token
+using the `SSE_WEBHOOK_URL` and `SSE_WEBHOOK_AUTH` environment variables. If you don't provide these variables, the
+server will not send any webhook notifications.
+
+Webhooks are sent as `POST` requests with a JSON payload:
+
+```
+POST /<webhook_url>/<client_id> HTTP/1.1
+Authorization: Bearer <SSE_WEBHOOK_AUTH>
+Content-Type: application/json
+```
+
+```json
+{
+  "topic": "topic",
+  "hash": "hash"
+}
+```
+
+- `hash` is a hexadecimal string that represents the base64-decoded message from client.
+- `topic` is a string that represents the topic of the message. Received from `topic` parameter from push endpoint.
+- `client_id` is the unique identifier of the client. Received from TON Connect.
 
 # Metrics
 

@@ -72,7 +72,7 @@ pub struct WebhookData {
     #[serde(skip_serializing)]
     pub client_id: String,
     pub topic: String,
-    pub hash: Vec<u8>,
+    pub hash: String,
 }
 
 pub struct WebhookStore {
@@ -509,7 +509,7 @@ impl SSE {
             let webhook_data = WebhookData {
                 client_id: client_id.clone(),
                 topic: topic.clone(),
-                hash: decoded_body.clone(),
+                hash: decoded_body.iter().map(|b| format!("{:02x}", b)).collect(),
             };
 
             webhook_store.store.lock().await.push(webhook_data);
