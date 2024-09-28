@@ -30,14 +30,14 @@ pub async fn webhook_worker(sse: &SSE) { // TODO: multiple workers
                         Ok(res) => {
                             if res.status().is_success() {
                                 debug!("webhook sent to [{}]", url);
-                                sse.metrics.lock().await.sent_webhooks.inc();
+                                sse.metrics.sent_webhooks.inc();
                             } else {
                                 debug!("webhook failed: incorrect status code {}", res.status());
-                                sse.metrics.lock().await.failed_webhooks.inc();
+                                sse.metrics.failed_webhooks.inc();
                             }
                         }
                         Err(e) => {
-                            sse.metrics.lock().await.failed_webhooks.inc();
+                            sse.metrics.failed_webhooks.inc();
                             debug!("webhook error: {}", e);
                         }
                     }

@@ -11,7 +11,7 @@ use base64::prelude::BASE64_STANDARD;
 use log::{debug, info};
 use serde_json::json;
 use tokio::select;
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, Mutex as AsyncMutex, RwLock};
 use tokio::time::sleep;
 use warp::http::StatusCode;
 use warp::reply::{json, with_status};
@@ -52,7 +52,7 @@ impl Event {
 struct Client {
     signal: broadcast::Sender<()>,
     last_used: Arc<AtomicI64>,
-    store: Arc<AsyncMutex<Vec<Event>>>,
+    store: Arc<RwLock<Vec<Event>>>,
     push_limiter: Arc<RateLimiter>,
 }
 
@@ -144,7 +144,7 @@ impl SSEConfig {
         Client {
             signal: tx,
             last_used: Arc::new(AtomicI64::new(current_time())),
-            store: Arc::new(AsyncMutex::new(Vec::with_capacity(32))),
+            store: Arc::new(RwLock::new(Vec::with_capacity(32))),
             push_limiter: Arc::new(push_limiter),
         }
     }
@@ -156,7 +156,7 @@ pub struct SSE {
     ping_waiters: Vec<broadcast::Sender<()>>,
     connections_iter: AtomicU64,
     pub config: SSEConfig,
-    pub metrics: Arc<AsyncMutex<Metrics>>,
+    pub metrics: Arc<Metrics>,
     pub webhook_store: Option<WebhookStore>,
 }
 
@@ -171,19 +171,16 @@ fn current_time() -> i64 {
 async fn send_events<'a>(
     clients: &'a [Client],
     last_event_id: &'a mut u64,
-    metrics: Arc<AsyncMutex<Metrics>>,
+    metrics: Arc<Metrics>,
 ) -> Pin<Box<dyn Stream<Item=Result<SseEvent, warp::Error>> + Send + 'a>> {
     let stream = async_stream::stream! {
             let current_time_seconds = current_time();
         
             for cli in clients {
-                let events = cli.store.lock().await;
+                let events = cli.store.read().await;
                 for e in events.iter() {
                     if e.id > *last_event_id && e.deadline - current_time_seconds >= 0 {
-                        {
-                            let metrics = metrics.lock().await;
-                            metrics.delivered_messages.inc();
-                        }
+                        metrics.delivered_messages.inc();
                         *last_event_id = max(*last_event_id, e.id);
                         yield Ok(e.to_sse_event());
                     }
@@ -196,7 +193,7 @@ async fn send_events<'a>(
 
 
 impl SSE {
-    pub fn new(config: SSEConfig, metrics: Arc<AsyncMutex<Metrics>>) -> Arc<SSE> {
+    pub fn new(config: SSEConfig, metrics: Arc<Metrics>) -> Arc<SSE> {
         let webhook_store = config.webhook_url.as_ref().map(|_url| {
             let (tx, _rx) = broadcast::channel(100);
             WebhookStore {
@@ -244,23 +241,15 @@ impl SSE {
 
                 debug!("clients size before cleanup: {}", clients.len());
 
-                let mut expired_clients_ids: Vec<String> = Vec::new();
-
-                for (id, cli) in clients.iter() {
+                clients.retain(|id, cli| {
                     let last_used = cli.last_used.load(Ordering::Relaxed);
                     let duration_secs = Duration::from_nanos((now - last_used) as u64).as_secs();
                     let receivers = cli.number_of_receivers();
 
-                    if duration_secs > self.config.client_ttl as u64 && receivers == 0 {
-                        expired_clients_ids.push(id.clone());
-                    }
-                }
+                    !(duration_secs > self.config.client_ttl as u64 && receivers == 0)
+                });
 
-                for id in expired_clients_ids {
-                    clients.remove(&id);
-                }
-
-                self.metrics.lock().await.active_subscriptions.set(clients.len() as f64);
+                self.metrics.active_subscriptions.set(clients.len() as f64);
 
                 debug!("clients size after cleanup: {}", clients.len());
             }
@@ -328,11 +317,8 @@ impl SSE {
 
         info!("subscribed [{}]", client_ids_str);
 
-        let metrics = self.metrics.lock().await;
 
-        {
-            metrics.requests.with_label_values(&["subscribe", host.as_str()]).observe(1.0);
-        }
+        self.metrics.requests.with_label_values(&["subscribe", host.as_str()]).observe(1.0);
 
         let metrics = self.metrics.clone();
         let mut last_event_id = last_event_id.unwrap_or(0);
@@ -478,8 +464,8 @@ impl SSE {
         };
 
         let current_time = current_time();
-        let mut events = cli.store.lock().await;
-        
+        let mut events = cli.store.write().await;
+
         // cleanup expired events
         events.retain(|e| e.deadline - current_time >= 0);
 
@@ -498,12 +484,9 @@ impl SSE {
 
         debug!("pushed [{}] to [{}]", client_id, to);
 
-        let metrics = self.metrics.lock().await;
 
-        {
-            metrics.pushed_messages.inc();
-            metrics.requests.with_label_values(&["push", host.as_str()]).observe(1.0);
-        }
+        self.metrics.pushed_messages.inc();
+        self.metrics.requests.with_label_values(&["push", host.as_str()]).observe(1.0);
 
         if let (Some(topic), Some(webhook_store)) = (topic, &self.webhook_store) {
             let webhook_data = WebhookData {

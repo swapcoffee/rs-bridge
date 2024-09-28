@@ -1,7 +1,5 @@
 use prometheus::{Counter, Gauge, HistogramVec, Opts, Registry};
 use std::sync::{Arc};
-use tokio::sync::{Mutex as AsyncMutex};
-
 
 pub struct Metrics {
     pub active_subscriptions: Gauge,
@@ -64,7 +62,7 @@ impl Metrics {
 
 pub fn register_metrics(
     registry: &Registry,
-) -> Arc<AsyncMutex<Metrics>> {
+) -> Arc<Metrics> {
     let metrics = Metrics::new(&registry);
-    Arc::new(AsyncMutex::new(metrics))
+    Arc::new(metrics)
 }
