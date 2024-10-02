@@ -41,9 +41,9 @@ impl Event {
 
 
         SseEvent::default()
-            .data(json.to_string())
-            .id(&self.id.to_string())
-            .event("message")
+            .data(format!(" {}", json.to_string()))
+            .id(format!(" {}", self.id))
+            .event(" message")
     }
 }
 
@@ -339,7 +339,7 @@ impl SSE {
                             info!("ping [{}]", client_ids_str);
                             
                             yield Ok::<_, warp::Error>(SseEvent::default()
-                                .event("heartbeat"));
+                                .event(" heartbeat"));
                         }
                     },
                     res = async {
