@@ -241,7 +241,7 @@ impl SSE {
 
                 debug!("clients size before cleanup: {}", clients.len());
 
-                clients.retain(|id, cli| {
+                clients.retain(|_id, cli| {
                     let last_used = cli.last_used.load(Ordering::Relaxed);
                     let duration_secs = Duration::from_nanos((now - last_used) as u64).as_secs();
                     let receivers = cli.number_of_receivers();
@@ -368,7 +368,7 @@ impl SSE {
             }
         };
 
-        let reply = warp::sse::reply(warp::sse::keep_alive().stream(stream));
+        let reply = warp::sse::reply(stream);
 
         Ok(Box::new(reply))
     }
