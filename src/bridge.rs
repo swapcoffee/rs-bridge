@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use log::{debug, info};
+use log::{debug, error, info};
 use serde_json::json;
 use tokio::select;
 use tokio::sync::{broadcast, Mutex as AsyncMutex, RwLock};
@@ -20,6 +20,7 @@ use leaky_bucket::RateLimiter;
 use serde::{Deserialize, Serialize};
 use crate::metrics::Metrics;
 use base64::decoded_len_estimate;
+use futures_util::stream::FuturesUnordered;
 use tokio_stream::{Stream, StreamExt};
 use crate::webhook::webhook_worker;
 
@@ -285,8 +286,8 @@ impl SSE {
         if ids.len() > self.config.max_clients_per_subscribe {
             return Ok(Box::new(with_status(
                 json(&json!({
-                    "error": "too many client_id passed"
-                })),
+                "error": "too many client_id passed"
+            })),
                 StatusCode::BAD_REQUEST,
             )));
         }
@@ -295,8 +296,8 @@ impl SSE {
             if id.is_empty() || id.len() > 64 {
                 return Ok(Box::new(with_status(
                     json(&json!({
-                        "error": "invalid client_id"
-                    })),
+                    "error": "invalid client_id"
+                })),
                     StatusCode::BAD_REQUEST,
                 )));
             }
@@ -308,6 +309,8 @@ impl SSE {
                     SSEConfig::new_client(&self.config)
                 }).clone();
 
+            debug!("client id: {}", id);
+
             clients.push(cli.clone());
             event_receivers.push(cli.signal.subscribe());
         }
@@ -317,14 +320,13 @@ impl SSE {
 
         info!("subscribed [{}]", client_ids_str);
 
-
         self.metrics.requests.with_label_values(&["subscribe", host.as_str()]).observe(1.0);
 
         let metrics = self.metrics.clone();
         let mut last_event_id = last_event_id.unwrap_or(0);
+
         let stream = async_stream::stream! {
             
-            // send missed events
             {
                 let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
                 while let Some(event) = event_stream.next().await {
@@ -332,35 +334,39 @@ impl SSE {
                 }
             }
 
+            let mut cloned_receivers: Vec<broadcast::Receiver<()>> = 
+                event_receivers.iter().map(|rx| rx.resubscribe()).collect();
+
             loop {
+                let mut recv_futures = cloned_receivers
+                    .iter_mut()
+                    .map(|rx| rx.recv())
+                    .collect::<FuturesUnordered<_>>();
+    
                 select! {
                     res = ping_receiver.recv() => {
                         if let Ok(_) = res {
                             info!("ping [{}]", client_ids_str);
-                            
+    
                             yield Ok::<_, warp::Error>(SseEvent::default()
-                                .event(" heartbeat"));
+                                .event("heartbeat"));
                         }
                     },
-                    res = async {
-                        let mut received = None;
-                        for rx in &mut event_receivers {
-                            if let Ok(val) = rx.recv().await {
-                                received = Some(val);
-                                break;
-                            }
-                        }
-                        received
-                    } => {
-                        if let Some(_) = res {
-                            info!("events signal [{}]", client_ids_str);
-                            
-                            // send actual events
-                            {
+                    res = recv_futures.next() => {
+                        match res {
+                            Some(Ok(_)) => {
+                                info!("events signal [{}]", client_ids_str);
+    
                                 let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
                                 while let Some(event) = event_stream.next().await {
                                     yield event;
                                 }
+                            },
+                            Some(Err(e)) => {
+                                error!("Error receiving event: {}", e);
+                            },
+                            None => {
+                                break;
                             }
                         }
                     }
@@ -498,7 +504,6 @@ impl SSE {
             webhook_store.store.lock().await.push(webhook_data);
             let _ = webhook_store.signal.send(());
         }
-
         let _ = cli.signal.send(());
         Ok(with_status(
             json(&json!({
