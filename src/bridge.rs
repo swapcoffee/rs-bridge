@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use async_stream::stream;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use log::{debug, error, info};
@@ -93,7 +93,7 @@ pub struct SSEConfig {
 
     pub webhook_url: Option<String>,
     pub webhook_auth: Option<String>,
-    
+
     pub bridge_port: u16,
     pub metrics_port: u16,
 }
@@ -114,7 +114,7 @@ impl SSEConfig {
 
         let webhook_url = env::var(format!("{}_WEBHOOK_URL", prefix)).ok();
         let webhook_auth = env::var(format!("{}_WEBHOOK_AUTH", prefix)).ok();
-        
+
         let bridge_port = get_env_or_default(&format!("{}_BRIDGE_PORT", prefix), 8080);
         let metrics_port = get_env_or_default(&format!("{}_METRICS_PORT", prefix), 8081);
 
@@ -168,13 +168,13 @@ fn current_time() -> i64 {
         .as_nanos() as i64
 }
 
-// Helper function for sending events
+/// Helper function for sending events
 async fn send_events<'a>(
     clients: &'a [Client],
     last_event_id: &'a mut u64,
     metrics: Arc<Metrics>,
 ) -> Pin<Box<dyn Stream<Item=Result<SseEvent, warp::Error>> + Send + 'a>> {
-    let stream = async_stream::stream! {
+    let stream = stream! {
             let current_time_seconds = current_time();
         
             for cli in clients {
@@ -190,6 +190,60 @@ async fn send_events<'a>(
         };
 
     Box::pin(stream)
+}
+
+/// Create a stream that listens for event or ping signals of given clients
+fn create_sse_stream(
+    clients: Vec<Client>,
+    event_receivers: Vec<broadcast::Receiver<()>>,
+    mut ping_receiver: broadcast::Receiver<()>,
+    mut last_event_id: u64,
+    client_ids_str: String,
+    metrics: Arc<Metrics>,
+) -> impl Stream<Item=Result<SseEvent, warp::Error>> {
+    stream! {
+        // Send any pending events
+        {
+            let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
+            while let Some(event) = event_stream.next().await {
+                yield event;
+            }
+        }
+
+        let mut cloned_receivers: Vec<broadcast::Receiver<()>> =
+            event_receivers.iter().map(|rx| rx.resubscribe()).collect();
+
+        loop {
+            let mut recv_futures = cloned_receivers
+                .iter_mut()
+                .map(|rx| rx.recv())
+                .collect::<FuturesUnordered<_>>();
+
+            select! {
+                res = ping_receiver.recv() => {
+                    if res.is_ok() {
+                        info!("ping [{}]", client_ids_str);
+                        yield Ok::<_, warp::Error>(SseEvent::default().event("heartbeat"));
+                    }
+                },
+                res = recv_futures.next() => {
+                    match res {
+                        Some(Ok(_)) => {
+                            info!("events signal [{}]", client_ids_str);
+                            let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
+                            while let Some(event) = event_stream.next().await {
+                                yield event;
+                            }
+                        },
+                        Some(Err(e)) => {
+                            error!("Error receiving event: {}", e);
+                        },
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
 }
 
 
@@ -316,63 +370,23 @@ impl SSE {
         }
 
         let ping_shard = self.connections_iter.fetch_add(1, Ordering::Relaxed) % self.config.heartbeat_groups as u64;
-        let mut ping_receiver = self.ping_waiters[ping_shard as usize].subscribe();
+        let ping_receiver = self.ping_waiters[ping_shard as usize].subscribe();
 
         info!("subscribed [{}]", client_ids_str);
 
         self.metrics.requests.with_label_values(&["subscribe", host.as_str()]).observe(1.0);
 
         let metrics = self.metrics.clone();
-        let mut last_event_id = last_event_id.unwrap_or(0);
+        let last_event_id = last_event_id.unwrap_or(0);
 
-        let stream = async_stream::stream! {
-            
-            {
-                let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
-                while let Some(event) = event_stream.next().await {
-                    yield event;
-                }
-            }
-
-            let mut cloned_receivers: Vec<broadcast::Receiver<()>> = 
-                event_receivers.iter().map(|rx| rx.resubscribe()).collect();
-
-            loop {
-                let mut recv_futures = cloned_receivers
-                    .iter_mut()
-                    .map(|rx| rx.recv())
-                    .collect::<FuturesUnordered<_>>();
-    
-                select! {
-                    res = ping_receiver.recv() => {
-                        if let Ok(_) = res {
-                            info!("ping [{}]", client_ids_str);
-    
-                            yield Ok::<_, warp::Error>(SseEvent::default()
-                                .event("heartbeat"));
-                        }
-                    },
-                    res = recv_futures.next() => {
-                        match res {
-                            Some(Ok(_)) => {
-                                info!("events signal [{}]", client_ids_str);
-    
-                                let mut event_stream = send_events(&clients, &mut last_event_id, metrics.clone()).await;
-                                while let Some(event) = event_stream.next().await {
-                                    yield event;
-                                }
-                            },
-                            Some(Err(e)) => {
-                                error!("Error receiving event: {}", e);
-                            },
-                            None => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        };
+        let stream = create_sse_stream(
+            clients,
+            event_receivers,
+            ping_receiver,
+            last_event_id,
+            client_ids_str.clone(),
+            metrics.clone(),
+        );
 
         let reply = warp::sse::reply(stream);
 
@@ -489,7 +503,6 @@ impl SSE {
         cli.set_used().await;
 
         debug!("pushed [{}] to [{}]", client_id, to);
-
 
         self.metrics.pushed_messages.inc();
         self.metrics.requests.with_label_values(&["push", host.as_str()]).observe(1.0);
