@@ -20,7 +20,6 @@ futures-util = "0.3.30"
 tokio-stream = "0.1.15"
 log = "0.4.22"
 bytes = "1.7.1"
-leaky-bucket = "1.1.2"
 prometheus = "0.13.4"
 reqwest = { version = "0.12", features = ["json"] }
 

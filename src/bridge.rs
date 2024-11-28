@@ -16,7 +16,6 @@ use tokio::time::sleep;
 use warp::http::StatusCode;
 use warp::reply::{json, with_status};
 use warp::sse::Event as SseEvent;
-use leaky_bucket::RateLimiter;
 use serde::{Deserialize, Serialize};
 use crate::metrics::Metrics;
 use base64::decoded_len_estimate;
@@ -54,7 +53,6 @@ struct Client {
     signal: broadcast::Sender<()>,
     last_used: Arc<AtomicI64>,
     store: Arc<RwLock<Vec<Event>>>,
-    push_limiter: Arc<RateLimiter>,
 }
 
 impl Client {
@@ -86,7 +84,6 @@ pub struct SSEConfig {
     pub enable_cors: bool,
     pub max_ttl: u32,
     pub max_clients_per_subscribe: usize,
-    pub max_pushes_per_sec: u32,
     pub client_ttl: u32,
     pub heartbeat_seconds: u64,
     pub heartbeat_groups: usize,
@@ -107,7 +104,6 @@ impl SSEConfig {
         let enable_cors = get_env_or_default(&format!("{}_ENABLE_CORS", prefix), true);
         let max_ttl = get_env_or_default(&format!("{}_MAX_TTL", prefix), 3600);
         let max_clients_per_subscribe = get_env_or_default(&format!("{}_MAX_CLIENTS_PER_SUBSCRIBE", prefix), 10);
-        let max_pushes_per_sec = get_env_or_default(&format!("{}_MAX_PUSHES_PER_SEC", prefix), 5);
         let heartbeat_seconds = get_env_or_default(&format!("{}_HEARTBEAT_SECONDS", prefix), 15);
         let heartbeat_groups = get_env_or_default(&format!("{}_HEARTBEAT_GROUPS", prefix), 8);
         let client_ttl = get_env_or_default(&format!("{}_CLIENT_TTL", prefix), 300); // 5 minutes
@@ -122,7 +118,6 @@ impl SSEConfig {
             enable_cors,
             max_ttl,
             max_clients_per_subscribe,
-            max_pushes_per_sec,
             client_ttl,
             heartbeat_seconds,
             heartbeat_groups,
@@ -134,19 +129,12 @@ impl SSEConfig {
     }
 
     fn new_client(&self) -> Client {
-        let push_limiter = RateLimiter::builder()
-            .interval(Duration::from_secs(1))
-            .max(self.max_pushes_per_sec as usize)
-            .initial(self.max_pushes_per_sec as usize)
-            .build();
-
         let (tx, _rx) = broadcast::channel(100);
 
         Client {
             signal: tx,
             last_used: Arc::new(AtomicI64::new(current_time())),
             store: Arc::new(RwLock::new(Vec::with_capacity(32))),
-            push_limiter: Arc::new(push_limiter),
         }
     }
 }
@@ -464,17 +452,6 @@ impl SSE {
             }).clone();
 
         let now_nanos = current_time();
-
-        // TODO: per-ip limits
-        if !cli.push_limiter.try_acquire(1) {
-            return Ok(with_status(
-                json(&json!({
-                        "error": "Rate limit exceeded"
-                    })),
-                StatusCode::TOO_MANY_REQUESTS,
-            ));
-        }
-
 
         let event = Event {
             id: now_nanos as u64,

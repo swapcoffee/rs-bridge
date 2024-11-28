@@ -38,7 +38,6 @@ You can configure the server using environment variables. Here is the list of av
 | **SSE_ENABLE_CORS**               | Enables or disables Cross-Origin Resource Sharing (CORS).                | true          | Boolean           |
 | **SSE_MAX_TTL**                   | Maximum Time-To-Live (TTL) for messages received from client in seconds. | 3600          | Integer           |
 | **SSE_MAX_CLIENTS_PER_SUBSCRIBE** | Maximum number of clients allowed per subscription.                      | 10            | Integer           |
-| **SSE_MAX_PUSHES_PER_SEC**        | Maximum number of pushes allowed per second.                             | 5             | Integer           |
 | **SSE_HEARTBEAT_SECONDS**         | Interval in seconds for sending heartbeat messages.                      | 15            | Integer           |
 | **SSE_HEARTBEAT_GROUPS**          | Number of heartbeat groups.                                              | 8             | Integer           |
 | **SSE_CLIENT_TTL**                | Time-To-Live (TTL) for clients connections without any listeners.        | 300           | Integer           |
