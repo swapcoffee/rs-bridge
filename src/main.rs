@@ -2,17 +2,17 @@ mod bridge;
 mod metrics;
 mod webhook;
 
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::error::Error;
-use std::sync::{Arc};
 use bytes::Bytes;
 use log::info;
 use prometheus::{Encoder, Registry, TextEncoder};
-use warp::{Filter, reject, Rejection, Reply};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::error::Error;
+use std::sync::Arc;
 use warp::http::StatusCode;
+use warp::{reject, Filter, Rejection, Reply};
 
-use crate::bridge::{SSE, SSEConfig};
+use crate::bridge::{SSEConfig, SSE};
 
 #[tokio::main]
 async fn main() {
@@ -20,16 +20,20 @@ async fn main() {
 
     let sse_config = SSEConfig::create_from_env("SSE");
     let allowed_headers = vec![
-        "DNT", "X-CustomHeader",
-        "Keep-Alive", "User-Agent",
+        "DNT",
+        "X-CustomHeader",
+        "Keep-Alive",
+        "User-Agent",
         "X-Requested-With",
         "If-Modified-Since",
-        "Cache-Control", "Content-Type", "Authorization", "Origin",
+        "Cache-Control",
+        "Content-Type",
+        "Authorization",
+        "Origin",
     ];
-    
+
     let bridge_port = sse_config.bridge_port.clone();
     let metrics_port = sse_config.metrics_port.clone();
-
 
     let cors = if sse_config.enable_cors {
         warp::cors()
@@ -53,9 +57,7 @@ async fn main() {
 
     let sse_filter = warp::any().map(move || sse.clone());
 
-    let options = warp::options()
-        .map(warp::reply)
-        .with(cors.clone());
+    let options = warp::options().map(warp::reply).with(cors.clone());
 
     // example: bridge/events?client_id=123&last_event_id=0
     let get_events = warp::path("bridge")
@@ -75,7 +77,6 @@ async fn main() {
         .and(warp::header::<String>("host"))
         .and_then(handle_subscribe);
 
-
     // example: bridge/message?client_id=123&to=456&ttl=300
     let push_message = warp::path("bridge")
         .and(warp::path("message"))
@@ -92,8 +93,10 @@ async fn main() {
         .or(push_message)
         .with(cors);
 
+    let routes = sse_routes
+        .recover(handle_rejection)
+        .with(warp::reply::with::header("x-powered-by", "swap.coffee"));
 
-    let routes = sse_routes.recover(handle_rejection);
     let addr = ([0, 0, 0, 0], bridge_port);
 
     let (addr, server) = warp::serve(routes).bind_ephemeral(addr);
@@ -112,9 +115,7 @@ async fn main() {
     }
 }
 
-async fn handle_metrics(
-    registry: Arc<Registry>,
-) -> Result<impl Reply, Rejection> {
+async fn handle_metrics(registry: Arc<Registry>) -> Result<impl Reply, Rejection> {
     let encoder = TextEncoder::new();
     let metric_families = registry.gather();
     let mut buffer = Vec::new();
@@ -133,11 +134,14 @@ async fn handle_subscribe(
     let empty_client_ids = "".to_string();
     let client_ids = params.get("client_id").unwrap_or(&empty_client_ids);
     let default_last_event_id = "0".to_string();
-    let last_event_id = params.get("last_event_id").unwrap_or(&default_last_event_id)
+    let last_event_id = params
+        .get("last_event_id")
+        .unwrap_or(&default_last_event_id)
         .parse()
         .unwrap_or(0);
 
-    sse.handle_subscribe(client_ids.to_owned(), Some(last_event_id), host).await
+    sse.handle_subscribe(client_ids.to_owned(), Some(last_event_id), host)
+        .await
 }
 
 async fn handle_push(
@@ -153,12 +157,17 @@ async fn handle_push(
     let to = params.get("to").unwrap_or(&empty_to);
 
     let default_ttl = "300".to_string();
-    let ttl = params.get("ttl").unwrap_or(&default_ttl).parse().unwrap_or(0);
+    let ttl = params
+        .get("ttl")
+        .unwrap_or(&default_ttl)
+        .parse()
+        .unwrap_or(0);
     let topic = params.get("topic");
 
     let body = body.to_vec();
 
-    sse.handle_push(client_id.to_owned(), to.to_owned(), ttl, topic, body, host).await
+    sse.handle_push(client_id.to_owned(), to.to_owned(), ttl, topic, body, host)
+        .await
 }
 
 async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
@@ -194,7 +203,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         message = "UNHANDLED_REJECTION";
     }
 
-    let json = warp::reply::json(&serde_json::json!({ 
+    let json = warp::reply::json(&serde_json::json!({
         "code": code.as_u16(),
         "message": message,
     }));
